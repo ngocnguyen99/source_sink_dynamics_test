@@ -1,0 +1,33 @@
+name: Validate analysis code
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Validate notebook JSON and Python syntax
+        run: python scripts/validate_notebook.py code/TRENDY_extraction_flux_locations_clean.ipynb
+
+  r-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+      - uses: r-lib/actions/setup-pandoc@v2
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::knitr
+      - name: Extract and parse R chunks
+        shell: Rscript {0}
+        run: |
+          output <- tempfile(fileext = ".R")
+          knitr::purl("code/Figure1_code_clean.Rmd", output = output, quiet = TRUE)
+          parse(file = output)
