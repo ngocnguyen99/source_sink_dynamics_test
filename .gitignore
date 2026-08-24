@@ -1,0 +1,12 @@
+.DS_Store
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+.Rhistory
+.RData
+.Rproj.user/
+data/**
+!data/README.md
+results/**
+!results/README.md
+code/*.html
