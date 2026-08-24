@@ -1,0 +1,361 @@
+---
+title: "Figure 1: short-term GPP–wood-growth coupling"
+author: "Ngoc Nguyen"
+date: "2025-10-27"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+This document reproduces Figure 1 from annual TRENDYv10 outputs and the
+site-level observations compiled by Cabon et al. (2022).
+
+## Run instructions
+
+Run from the repository's `code/` directory:
+
+```bash
+Rscript -e 'rmarkdown::render("Figure1_code_clean.Rmd")'
+```
+
+Alternatively, set `SOURCE_SINK_ROOT` to the repository root before rendering:
+
+```bash
+SOURCE_SINK_ROOT=/path/to/source_sink_dynamics \
+  Rscript -e 'rmarkdown::render("code/Figure1_code_clean.Rmd")'
+```
+
+Expected inputs and generated outputs are defined in the setup chunk below.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(purrr)
+
+# Set SOURCE_SINK_ROOT when rendering from outside code/.
+project_root <- normalizePath(
+  Sys.getenv("SOURCE_SINK_ROOT", unset = ".."),
+  mustWork = TRUE
+)
+
+data_dir <- normalizePath(
+  Sys.getenv(
+    "CABON_DATA_DIR",
+    unset = file.path(project_root, "data", "cabon")
+  ),
+  mustWork = TRUE
+)
+trendy_dir <- file.path(project_root, "results", "TRENDYv10", "31_site_weighted")
+derived_dir <- file.path(project_root, "results", "datasets")
+figure_dir <- file.path(project_root, "results", "figures")
+
+dir.create(derived_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+models <- c(
+  "ISBA-CTRIP", "CABLE-POP", "CLM5.0", "LPJ-GUESS", "LPX-Bern",
+  "ORCHIDEE", "ORCHIDEEv3", "CLASSIC-N", "CLASSIC"
+)
+scenarios <- c("S0", "S1", "S2")
+wood_variable <- "cWood"
+
+required_inputs <- c(
+  file.path(data_dir, "Cabonetal_site_info.csv"),
+  file.path(data_dir, "rw_onsite.csv"),
+  file.path(data_dir, "flux_onsite.csv")
+)
+
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+if (length(missing_inputs) > 0) {
+  stop("Missing required input files:\n", paste("-", missing_inputs, collapse = "\n"))
+}
+```
+
+## Reusable functions
+
+```{r functions}
+assert_files_exist <- function(paths, context) {
+  missing <- paths[!file.exists(paths)]
+  if (length(missing) > 0) {
+    stop(context, ":\n", paste("-", missing, collapse = "\n"))
+  }
+}
+
+detrended_correlation <- function(x, y, min_n = 4L) {
+  values <- data.frame(x = x, y = y) |>
+    filter(is.finite(x), is.finite(y)) |>
+    mutate(time_index = row_number())
+
+  if (nrow(values) < min_n || sd(values$x) == 0 || sd(values$y) == 0) {
+    return(tibble(n = nrow(values), correlation = NA_real_, p_value = NA_real_))
+  }
+
+  x_residual <- residuals(lm(x ~ time_index, data = values))
+  y_residual <- residuals(lm(y ~ time_index, data = values))
+  test <- cor.test(x_residual, y_residual, method = "pearson")
+
+  tibble(
+    n = nrow(values),
+    correlation = unname(test$estimate),
+    p_value = test$p.value
+  )
+}
+
+model_input_paths <- function(model, scenario) {
+  model_dir <- file.path(trendy_dir, model)
+  c(
+    gpp = file.path(model_dir, sprintf("gpp_%s_31_site_weighted_yearly_mean.csv", scenario)),
+    wood = file.path(model_dir, sprintf("%s_%s_31_site_weighted_yearly_mean.csv", wood_variable, scenario)),
+    sites = file.path(model_dir, sprintf("%s_site_info.csv", model))
+  )
+}
+
+model_statistics_path <- function(model, scenario) {
+  file.path(
+    derived_dir,
+    sprintf(
+      "%s_%s_detrended_r_normal_delta_31_gpp_TRENDYv10_temporalMatch_not_scale%s.csv",
+      model, wood_variable, scenario
+    )
+  )
+}
+
+significance_label <- function(p_value) {
+  case_when(
+    is.na(p_value) ~ "",
+    p_value < 0.001 ~ "***",
+    p_value < 0.01 ~ "**",
+    p_value < 0.05 ~ "*",
+    TRUE ~ ""
+  )
+}
+
+safe_paired_test <- function(model_values, observed_values) {
+  keep <- is.finite(model_values) & is.finite(observed_values)
+  if (sum(keep) < 2) return(NA_real_)
+  t.test(model_values[keep], observed_values[keep], paired = TRUE)$p.value
+}
+```
+
+## Site metadata
+
+```{r site-metadata}
+site_metadata <- read.csv(file.path(data_dir, "Cabonetal_site_info.csv")) |>
+  filter(On.site.RW) |>
+  transmute(SITE_ID = Site, Start, End)
+
+if (anyDuplicated(site_metadata$SITE_ID)) {
+  stop("Cabon site metadata contains duplicate SITE_ID values.")
+}
+```
+
+## Calculate model correlations
+
+For every model and scenario, this section aligns GPP and wood carbon by year
+and grid cell, limits each site to its observational period, linearly detrends
+both series, and calculates their Pearson correlation.
+
+```{r model-correlations}
+calculate_model_statistics <- function(model, scenario) {
+  paths <- model_input_paths(model, scenario)
+  assert_files_exist(paths, sprintf("Missing inputs for %s %s", model, scenario))
+
+  gpp <- read.csv(paths[["gpp"]]) |>
+    filter(is.finite(gpp))
+
+  wood <- read.csv(paths[["wood"]]) |>
+    filter(is.finite(.data[[wood_variable]]), .data[[wood_variable]] != 0)
+
+  # CLM5.0 output ends before 2020 in this analysis.
+  if (model == "CLM5.0") {
+    gpp <- filter(gpp, year < 2020)
+    wood <- filter(wood, year < 2020)
+  }
+
+  site_coordinates <- read.csv(paths[["sites"]])
+
+  aligned <- inner_join(gpp, wood, by = c("year", "lat", "lon")) |>
+    inner_join(site_coordinates, by = c("lat", "lon")) |>
+    inner_join(site_metadata, by = "SITE_ID") |>
+    filter(year >= Start, year <= End) |>
+    arrange(SITE_ID, year) |>
+    mutate(gpp = gpp * 1000)
+
+  statistics <- aligned |>
+    group_by(lat, lon, SITE_ID) |>
+    group_modify(~ detrended_correlation(.x[[wood_variable]], .x$gpp)) |>
+    ungroup() |>
+    rename(
+      r_detrend_delta = correlation,
+      p_detrend_delta = p_value
+    ) |>
+    filter(is.finite(r_detrend_delta))
+
+  write.csv(
+    statistics,
+    model_statistics_path(model, scenario),
+    row.names = FALSE
+  )
+
+  statistics
+}
+
+model_statistics <- tidyr::crossing(model = models, scenario = scenarios) |>
+  mutate(statistics = map2(model, scenario, calculate_model_statistics))
+```
+
+## Calculate observational correlations
+
+```{r observation-correlations}
+ring_width <- read.csv(file.path(data_dir, "rw_onsite.csv"))
+
+annual_gpp <- read.csv(file.path(data_dir, "flux_onsite.csv")) |>
+  filter(QC > 0.7) |>
+  summarise(GPP_dtrd = mean(GPP_dtrd, na.rm = TRUE), .by = c(Year, Site))
+
+observations <- inner_join(ring_width, annual_gpp, by = c("Year", "Site")) |>
+  filter(is.finite(GPP_dtrd), is.finite(RWI_dtrd)) |>
+  group_by(IDcrn) |>
+  group_modify(~ detrended_correlation(.x$GPP_dtrd, .x$RWI_dtrd)) |>
+  ungroup() |>
+  mutate(SITE_ID = substr(IDcrn, 1, 6)) |>
+  summarise(
+    r_observed = mean(correlation, na.rm = TRUE),
+    p_observed = mean(p_value, na.rm = TRUE),
+    .by = SITE_ID
+  )
+```
+
+## Assemble matched comparisons
+
+Model–observation paired tests are explicitly aligned by `SITE_ID` before the
+test is run.
+
+```{r matched-comparisons}
+model_results <- model_statistics |>
+  select(model, scenario, statistics) |>
+  tidyr::unnest(statistics)
+
+matched_results <- model_results |>
+  inner_join(observations, by = "SITE_ID")
+
+paired_tests <- matched_results |>
+  summarise(
+    p_value = safe_paired_test(r_detrend_delta, r_observed),
+    .by = c(model, scenario)
+  ) |>
+  mutate(asterisk = significance_label(p_value))
+
+plot_data <- matched_results |>
+  select(model, scenario, SITE_ID, r_detrend_delta) |>
+  bind_rows(
+    matched_results |>
+      distinct(model, SITE_ID, r_observed) |>
+      transmute(
+        model,
+        scenario = "obs",
+        SITE_ID,
+        r_detrend_delta = r_observed
+      )
+  ) |>
+  mutate(scenario = factor(scenario, levels = c("obs", scenarios)))
+```
+
+## Generate Figure 1
+
+```{r figure-1, fig.width=7, fig.height=6.5}
+make_model_panel <- function(model_name) {
+  panel_data <- filter(plot_data, model == model_name)
+  n_sites <- n_distinct(panel_data$SITE_ID)
+
+  annotations <- panel_data |>
+    summarise(y_position = min(1.1, max(r_detrend_delta, na.rm = TRUE) + 0.05), .by = scenario) |>
+    left_join(
+      paired_tests |>
+        filter(model == model_name) |>
+        select(scenario, asterisk),
+      by = "scenario"
+    ) |>
+    mutate(asterisk = coalesce(asterisk, ""))
+
+  ggplot(panel_data, aes(scenario, r_detrend_delta)) +
+    geom_boxplot(
+      linewidth = 0.3,
+      alpha = 0.5,
+      outlier.shape = NA,
+      colour = "#3c5488",
+      fill = "#3c5488"
+    ) +
+    geom_jitter(
+      width = 0.15,
+      size = 0.5,
+      alpha = 0.5,
+      colour = "#3c5488"
+    ) +
+    geom_text(
+      data = annotations,
+      aes(scenario, y_position, label = asterisk),
+      inherit.aes = FALSE,
+      size = 3.5
+    ) +
+    annotate(
+      "text",
+      x = 0.6,
+      y = -0.8,
+      label = sprintf("%s (n = %d)", model_name, n_sites),
+      hjust = 0,
+      vjust = 1,
+      size = 3.5
+    ) +
+    coord_cartesian(ylim = c(-1, 1.2)) +
+    labs(
+      x = NULL,
+      y = expression(r[Delta * italic(cWood) * "," ~ italic(GPP)])
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position = "none",
+      panel.grid = element_blank()
+    )
+}
+
+plots <- map(models, make_model_panel)
+
+for (index in seq_along(plots)) {
+  if (index %% 3 != 1) {
+    plots[[index]] <- plots[[index]] +
+      theme(axis.title.y = element_blank(), axis.text.y = element_blank())
+  }
+  if (index <= 6) {
+    plots[[index]] <- plots[[index]] +
+      theme(axis.text.x = element_blank())
+  }
+}
+
+figure_1 <- wrap_plots(plots, ncol = 3) +
+  plot_annotation(tag_levels = "a")
+
+ggsave(
+  filename = file.path(figure_dir, "Figure1.pdf"),
+  plot = figure_1,
+  width = 7,
+  height = 6.5,
+  units = "in"
+)
+
+figure_1
+```
+
+## Session information
+
+```{r session-information}
+sessionInfo()
+```
